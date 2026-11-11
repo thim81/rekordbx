@@ -144,18 +144,11 @@ function Index() {
       replace: true,
     });
   }, [navigate]);
-  const clearCrateUrl = useCallback(() => {
-    void navigate({
-      search: (previous) => {
-        const next = { ...previous };
-        delete next.crate_playlist_id;
-        delete next.crate_track_id;
-        delete next.rekordbox_playlist_id;
-        delete next.rekordbox_track_id;
-        return next;
-      },
-      replace: true,
-    });
+  const updateRekordboxUrl = useCallback((playlistId: string) => {
+    void navigate({ search: { rekordbox_playlist_id: playlistId }, replace: true });
+  }, [navigate]);
+  const clearPlaylistUrl = useCallback(() => {
+    void navigate({ search: {}, replace: true });
   }, [navigate]);
   const [apiUrl, setApiUrl] = useState("http://localhost:8000");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -417,6 +410,7 @@ function Index() {
         setRekordboxFolderId(null);
         setRekordboxLoaded(true);
         setActiveRekordboxId(created.id);
+        updateRekordboxUrl(created.id);
         setRekordboxError(null);
         try {
           setRekordboxPlaylists(await getRekordboxPlaylists(apiUrl));
@@ -451,7 +445,7 @@ function Index() {
     } finally {
       setCreatingPlaylist(false);
     }
-  }, [apiUrl, playlistSource, updateCrateUrl]);
+  }, [apiUrl, playlistSource, updateCrateUrl, updateRekordboxUrl]);
 
   const renamePlaylist = useCallback(async (playlist: Playlist, name: string) => {
     if (playlistSource === 'rekordbox') return runRekordboxEdit({ action: 'rename', name });
@@ -510,7 +504,7 @@ function Index() {
         setRangeAnchor(null);
         setActiveId(next?.id ?? "");
         if (next) updateCrateUrl(next.id);
-        else clearCrateUrl();
+        else clearPlaylistUrl();
       }
       setPendingPlaylistDeletion(null);
       toast.success(`Deleted “${pending.name}”.`);
@@ -519,7 +513,7 @@ function Index() {
     } finally {
       setDeletingPlaylist(false);
     }
-  }, [activeId, apiUrl, clearCrateUrl, pendingPlaylistDeletion, playlistSource, playlists, updateCrateUrl]);
+  }, [activeId, apiUrl, clearPlaylistUrl, pendingPlaylistDeletion, playlistSource, playlists, updateCrateUrl]);
 
   const refreshCollectionStatus = useCallback(async () => {
     try {
@@ -559,10 +553,22 @@ function Index() {
   const changePlaylistSource = (source: "crate" | "rekordbox") => {
     setPlaylistSource(source);
     setApiError(null);
-    if (source === "crate" && activeId) {
-      updateCrateUrl(activeId, selectedTrackByPlaylist.current.get(`crate:${activeId}`));
+    if (source === "crate") {
+      if (activeId) updateCrateUrl(activeId, selectedTrackByPlaylist.current.get(`crate:${activeId}`));
+      else clearPlaylistUrl();
+    } else {
+      if (source !== playlistSource) {
+        if (activeRekordboxId) updateRekordboxUrl(activeRekordboxId);
+        else clearPlaylistUrl();
+      }
+      if (!rekordboxLoaded && !rekordboxRefreshing) void refreshRekordboxPlaylists();
     }
-    if (source === "rekordbox" && !rekordboxLoaded) void refreshRekordboxPlaylists();
+  };
+
+  const openRekordboxFolder = (folderId: string | null) => {
+    setRekordboxFolderId(folderId);
+    setActiveRekordboxId("");
+    clearPlaylistUrl();
   };
 
   const selectCratePlaylist = (playlistId: string) => {
@@ -1011,34 +1017,6 @@ function Index() {
     pendingRekordboxJump.current = null;
   }, [activeRekordboxId, playlistSource, selectTrackAt, view]);
 
-  const openRekordboxPlaylistAtTrack = useCallback((playlistId: string, trackId: string) => {
-    pendingRekordboxJump.current = { playlistId, trackId };
-    setExpandedLookupTrackId(null);
-    setQ("");
-    setMissingArtworkOnly(false);
-    setSort({ k: null, dir: 1 });
-    if (playlistSource === "rekordbox" && activeRekordboxId === playlistId) {
-      const index = view.findIndex((track) => track.rekordbox_id === trackId);
-      if (index >= 0) {
-        selectTrackAt(index);
-        pendingRekordboxJump.current = null;
-      }
-      return;
-    }
-    setRekordboxTracks([]);
-    setPlaylistSource("rekordbox");
-    setActiveRekordboxId(playlistId);
-    setRekordboxFolderId(null);
-    if (!rekordboxLoaded) void refreshRekordboxPlaylists();
-  }, [
-    activeRekordboxId,
-    playlistSource,
-    rekordboxLoaded,
-    refreshRekordboxPlaylists,
-    selectTrackAt,
-    view,
-  ]);
-
   const navigateToRekordboxPlaylistAtTrack = useCallback((playlistId: string, trackId: string) => {
     void navigate({
       search: {
@@ -1051,18 +1029,33 @@ function Index() {
   useEffect(() => {
     const playlistId = search.rekordbox_playlist_id;
     const trackId = search.rekordbox_track_id;
-    const deepLink = playlistId && trackId ? `${playlistId}:${trackId}` : null;
+    const deepLink = playlistId ? JSON.stringify([playlistId, trackId]) : null;
     if (appliedRekordboxDeepLink.current === deepLink) return;
     appliedRekordboxDeepLink.current = deepLink;
-    if (playlistId && trackId) {
-      openRekordboxPlaylistAtTrack(playlistId, trackId);
-    } else if (playlistSource === "rekordbox") {
-      pendingRekordboxJump.current = null;
-      setPlaylistSource("crate");
+    pendingRekordboxJump.current = null;
+    if (!playlistId) {
+      if (activeRekordboxId && playlistSource === "rekordbox") setPlaylistSource("crate");
+      return;
     }
+    if (trackId) {
+      pendingRekordboxJump.current = { playlistId, trackId };
+      setExpandedLookupTrackId(null);
+      setQ("");
+      setMissingArtworkOnly(false);
+      setSort({ k: null, dir: 1 });
+    }
+    if (activeRekordboxId !== playlistId) {
+      setRekordboxTracks([]);
+      setActiveRekordboxId(playlistId);
+    }
+    setPlaylistSource("rekordbox");
+    if (!rekordboxLoaded && !rekordboxRefreshing) void refreshRekordboxPlaylists();
   }, [
-    openRekordboxPlaylistAtTrack,
+    activeRekordboxId,
     playlistSource,
+    rekordboxLoaded,
+    rekordboxRefreshing,
+    refreshRekordboxPlaylists,
     search.rekordbox_playlist_id,
     search.rekordbox_track_id,
   ]);
@@ -1746,15 +1739,9 @@ function Index() {
           onDeletePlaylist={(playlist) =>
             setPendingPlaylistDeletion({ id: playlist.id, name: playlist.name })
           }
-          onSelectRekordboxPlaylist={setActiveRekordboxId}
-          onOpenRekordboxFolder={(folderId) => {
-            setRekordboxFolderId(folderId);
-            setActiveRekordboxId("");
-          }}
-          onGoUpRekordboxFolder={() => {
-            setRekordboxFolderId(activeRekordboxFolder?.parent_id ?? null);
-            setActiveRekordboxId("");
-          }}
+          onSelectRekordboxPlaylist={updateRekordboxUrl}
+          onOpenRekordboxFolder={openRekordboxFolder}
+          onGoUpRekordboxFolder={() => openRekordboxFolder(activeRekordboxFolder?.parent_id ?? null)}
         />
 
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
