@@ -22,17 +22,14 @@ def test_playlist_edit_forwards_entry_ids_and_revision_without_retry(monkeypatch
         name=None, entry_ids=['503'], track_ids=None, position=1, target_entry_id=None, before=True))]
 
 
-def test_detail_rejects_mixed_playlist_revisions(monkeypatch):
+def test_detail_uses_one_collection_read_and_keeps_its_revision(monkeypatch):
     async def tool(name, arguments=None):
-        return {'id':'100','revision':'r','entries':[{'entry_id':'501','track_id':'1','position':1}]}
-    async def tracks(_):
-        return [{'id':'different-entry','rekordbox_id':'1'}]
+        assert (name, arguments) == ('get_playlist_detail', {'playlist_id': '100'})
+        return {'id': '100', 'revision': 'r', 'editable': True, 'tracks': []}
     monkeypatch.setattr(api, 'call_tool', tool)
-    monkeypatch.setattr(api, 'get_rekordbox_playlist_tracks', tracks)
-    assert hasattr(api, 'get_rekordbox_playlist_detail')
-    with pytest.raises(api.HTTPException) as caught:
-        asyncio.run(api.get_rekordbox_playlist_detail('100'))
-    assert caught.value.status_code == 409
+    assert asyncio.run(api.get_rekordbox_playlist_detail('100')) == {
+        'id': '100', 'name': '', 'revision': 'r', 'editable': True, 'tracks': [],
+    }
 
 
 def test_database_mutations_reject_remote_browser_origins():

@@ -14,8 +14,10 @@ from fastmcp.exceptions import ToolError
 from loguru import logger
 from rekordbox_mcp import database as upstream_database
 from rekordbox_mcp import server as upstream
+from rekordbox_mcp.models import Playlist
 from pyrekordbox.masterdb.models import DjmdContent, DjmdCue, DjmdPlaylist, DjmdSongPlaylist
-from sqlalchemy import func
+from sqlalchemy import and_, func
+from sqlalchemy.orm import joinedload
 
 from .direct import DirectDatabase, PlaylistEditor, content_by_ids, playlist_state
 from .backup import DEFAULT_BACKUP_DIRECTORY
@@ -25,7 +27,7 @@ READ_TOOLS = (
     "search_tracks", "get_track_details", "get_tracks_by_key",
     "get_tracks_by_bpm_range", "get_most_played_tracks", "get_top_rated_tracks",
     "get_unplayed_tracks", "search_tracks_by_filename", "analyze_library",
-    "validate_track_ids", "get_playlists", "get_playlist_tracks",
+    "validate_track_ids",
     "get_library_stats", "get_history_sessions", "get_session_tracks",
     "get_recent_sessions", "get_history_stats", "search_history_sessions",
 )
@@ -109,73 +111,6 @@ def build_server(source: Path, backup_directory: Path = DEFAULT_BACKUP_DIRECTORY
                 upstream.ensure_database_connected = ensure_connected
                 await ensure_connected()
                 result = await complete_before_cancellation(original(*args, **kwargs))
-                if tool_name == "get_playlists":
-                    def playlist_summaries():
-                        durations = dict(database.db.session.query(
-                            DjmdSongPlaylist.PlaylistID, func.sum(DjmdContent.Length),
-                        ).join(DjmdContent, DjmdContent.ID == DjmdSongPlaylist.ContentID).filter(
-                            DjmdSongPlaylist.rb_local_deleted == 0, DjmdContent.rb_local_deleted == 0,
-                        ).group_by(DjmdSongPlaylist.PlaylistID).all())
-                        return {
-                            str(playlist.ID): {
-                                'sequence': int(getattr(playlist, 'Seq', 0) or 0),
-                                'duration': int(durations.get(str(playlist.ID)) or 0),
-                            }
-                            for playlist in database.db.get_playlist()
-                        }
-
-                    summaries = await run_database_operation(playlist_summaries)
-                    result = [
-                        {**playlist, **summaries.get(str(playlist.get('id') or ''), {})}
-                        for playlist in result
-                    ]
-                elif tool_name == "get_playlist_tracks" and isinstance(result, list):
-                    def add_usage_counts():
-                        track_ids = list(dict.fromkeys(
-                            str(track.get("id") or "")
-                            for track in result
-                            if isinstance(track, dict) and track.get("id") is not None
-                        ))
-                        if not track_ids:
-                            return result
-                        cue_counts = dict(database.db.session.query(
-                            DjmdCue.ContentID, func.count(DjmdCue.ID),
-                        ).filter(
-                            DjmdCue.ContentID.in_(track_ids),
-                            DjmdCue.rb_local_deleted == 0,
-                        ).group_by(DjmdCue.ContentID).all())
-                        playlist_rows = database.db.session.query(
-                            DjmdSongPlaylist.ContentID,
-                            DjmdPlaylist.ID,
-                            DjmdPlaylist.Name,
-                        ).join(
-                            DjmdPlaylist, DjmdPlaylist.ID == DjmdSongPlaylist.PlaylistID,
-                        ).filter(
-                            DjmdSongPlaylist.ContentID.in_(track_ids),
-                            DjmdSongPlaylist.rb_local_deleted == 0,
-                            DjmdPlaylist.rb_local_deleted == 0,
-                        ).distinct().order_by(DjmdPlaylist.Name).all()
-                        memberships = {}
-                        for content_id, playlist_id, playlist_name in playlist_rows:
-                            memberships.setdefault(str(content_id), []).append({
-                                "id": str(playlist_id),
-                                "name": str(playlist_name or ""),
-                            })
-                        entries = database.db.query(DjmdSongPlaylist).join(DjmdContent, DjmdContent.ID == DjmdSongPlaylist.ContentID).filter(
-                            DjmdContent.rb_local_deleted == 0,
-                            DjmdSongPlaylist.PlaylistID == str(kwargs.get('playlist_id') or (args[0] if args else '')),
-                            DjmdSongPlaylist.rb_local_deleted == 0,
-                        ).order_by(DjmdSongPlaylist.TrackNo).all()
-                        for track, entry in zip(result, entries, strict=True):
-                            track['playlist_entry_id'] = str(entry.ID)
-                            track_id = str(track.get("id") or "")
-                            track_playlists = memberships.get(track_id, [])
-                            track["cue_count"] = cue_counts.get(track_id, 0)
-                            track["playlist_count"] = len(track_playlists)
-                            track["playlists"] = track_playlists
-                        return result
-
-                    result = await run_database_operation(add_usage_counts)
                 return result if tool_name == "get_track_file_path" else redact_paths(result)
         return call
 
@@ -185,6 +120,86 @@ def build_server(source: Path, backup_directory: Path = DEFAULT_BACKUP_DIRECTORY
         server.tool(
             name=name, annotations={"readOnlyHint": True, "destructiveHint": False},
         )(wrap(original, name))
+
+    @server.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+    async def get_playlists() -> list[dict]:
+        """List active Rekordbox playlists and folders with counts and durations."""
+        def read():
+            session = database.db.session
+            totals = session.query(
+                DjmdSongPlaylist.PlaylistID.label("playlist_id"),
+                func.count(DjmdSongPlaylist.ID).label("track_count"),
+                func.sum(DjmdContent.Length).label("duration"),
+            ).outerjoin(DjmdContent, and_(
+                DjmdContent.ID == DjmdSongPlaylist.ContentID,
+                DjmdContent.rb_local_deleted == 0,
+            )).filter(DjmdSongPlaylist.rb_local_deleted == 0).group_by(DjmdSongPlaylist.PlaylistID).subquery()
+            rows = session.query(DjmdPlaylist, totals.c.track_count, totals.c.duration).outerjoin(
+                totals, totals.c.playlist_id == DjmdPlaylist.ID,
+            ).filter(DjmdPlaylist.rb_local_deleted == 0).all()
+            return [
+                Playlist(
+                    id=str(playlist.ID), name=playlist.Name or "", track_count=count or 0,
+                    created_date=playlist.created_at or "", modified_date=playlist.updated_at or "",
+                    is_folder=playlist.is_folder, is_smart_playlist=playlist.is_smart_playlist,
+                    smart_criteria=str(playlist.SmartList) if playlist.is_smart_playlist and playlist.SmartList else None,
+                    parent_id=str(playlist.ParentID) if playlist.ParentID and playlist.ParentID != "root" else None,
+                ).model_dump() | {"duration": duration or 0, "sequence": int(playlist.Seq or 0)}
+                for playlist, count, duration in rows
+            ]
+
+        async with session_scope():
+            await ensure_connected()
+            return await run_database_operation(read)
+
+    def read_playlist_detail(playlist_id: str) -> dict:
+        session = database.db.session
+        # Use one SQLite read transaction for the revision, ordered entries and their metadata.
+        session.connection().exec_driver_sql("BEGIN")
+        state = playlist_state(database.db, playlist_id)
+        ids = {entry["track_id"] for entry in state["entries"]}
+        tracks = {}
+        if ids:
+            content = session.query(DjmdContent).options(
+                joinedload(DjmdContent.Artist), joinedload(DjmdContent.Album),
+                joinedload(DjmdContent.Genre), joinedload(DjmdContent.Key),
+            ).filter(DjmdContent.ID.in_(ids)).all()
+            cue_counts = dict(session.query(DjmdCue.ContentID, func.count(DjmdCue.ID)).filter(
+                DjmdCue.ContentID.in_(ids), DjmdCue.rb_local_deleted == 0,
+            ).group_by(DjmdCue.ContentID).all())
+            memberships = {}
+            for content_id, playlist_id, name in session.query(
+                DjmdSongPlaylist.ContentID, DjmdPlaylist.ID, DjmdPlaylist.Name,
+            ).join(DjmdPlaylist, DjmdPlaylist.ID == DjmdSongPlaylist.PlaylistID).filter(
+                DjmdSongPlaylist.ContentID.in_(ids), DjmdSongPlaylist.rb_local_deleted == 0,
+                DjmdPlaylist.rb_local_deleted == 0,
+            ).distinct().order_by(DjmdPlaylist.Name):
+                memberships.setdefault(str(content_id), []).append({"id": str(playlist_id), "name": name or ""})
+            for row in content:
+                key = str(row.ID)
+                playlists = memberships.get(key, [])
+                tracks[key] = database._content_to_track(row).model_dump() | {
+                    "cue_count": cue_counts.get(key, 0),
+                    "playlist_count": len(playlists),
+                    "playlists": playlists,
+                }
+        return {**state, "tracks": [
+            {**tracks[entry["track_id"]], "playlist_entry_id": entry["entry_id"]}
+            for entry in state["entries"]
+        ]}
+
+    @server.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+    async def get_playlist_detail(playlist_id: str) -> dict:
+        """Read one playlist's revision and ordered tracks. File locations are internal to trusted local clients."""
+        async with session_scope():
+            await ensure_connected()
+            return await run_database_operation(lambda: read_playlist_detail(playlist_id))
+
+    @server.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+    async def get_playlist_tracks(playlist_id: str) -> list[dict]:
+        """Read ordered playlist tracks and entry IDs, omitting local file paths."""
+        detail = await get_playlist_detail(playlist_id)
+        return redact_paths(detail["tracks"])
 
     @server.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
     async def get_collection_tracks(

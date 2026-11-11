@@ -776,11 +776,12 @@ def test_rekordbox_playlist_rating_prefers_the_embedded_audio_rating(tmp_path, m
     artwork_write.set_audio_rating(source, 5)
 
     async def call_tool(name, arguments=None):
-        if name == "get_playlist_tracks":
-            return [{"id": "track-1", "rating": 1, "title": "Test track"}]
-        if name == "get_collection_tracks":
-            return [{"id": "track-1", "file_path": str(source)}]
-        pytest.fail(f"Unexpected collection tool {name}")
+        assert name == "get_playlist_detail"
+        assert arguments == {"playlist_id": "playlist-1"}
+        return {"id": "playlist-1", "revision": "revision", "editable": True, "tracks": [
+            {"id": "track-1", "playlist_entry_id": "entry-1", "rating": 1, "title": "Test track",
+             "file_path": str(source)},
+        ]}
 
     monkeypatch.setattr(rekordbox_playlists, "call_tool", call_tool)
     collection_mcp.track_paths.pop("track-1", None)
@@ -789,3 +790,5 @@ def test_rekordbox_playlist_rating_prefers_the_embedded_audio_rating(tmp_path, m
 
     collection_mcp.track_paths.pop("track-1", None)
     assert tracks[0]["rating"] == 5
+    assert tracks[0]["id"] == "entry-1"
+    assert "file_path" not in tracks[0]

@@ -19,7 +19,7 @@ Startup and every collection operation require Rekordbox and its agents to be cl
 
 The reviewed upstream reading-tool allowlist remains explicit. `get_collection_tracks` resolves ordered IDs, exact absolute locations, or pages of active collection records. The upstream `get_track_file_path` resolves the location of one active track by ID. These location tools are an internal contract for trusted local application clients. Keep them out of conversational MCP allowlists. Other collection responses redact file and database paths.
 
-`get_playlist_state` returns the playlist ID, name, editable flag, revision, and ordered entries containing `entry_id`, `track_id`, and one-based `position`. `get_playlist_tracks` includes `playlist_entry_id`. Playlists with unresolved collection references remain viewable but cannot be edited.
+`get_playlist_state` returns the playlist ID, name, editable flag, revision, and ordered entries containing `entry_id`, `track_id`, and one-based `position`. `get_playlist_tracks` includes `playlist_entry_id`. The internal `get_playlist_detail` tool returns state, tracks, and file locations from one read transaction. Keep it out of conversational MCP allowlists. Playlists with unresolved collection references remain viewable but cannot be edited.
 
 `edit_playlist` accepts `create`, `rename`, `add`, `remove`, `swap`, or `move`. Existing-playlist operations require the revision returned by `get_playlist_state`. Remove, swap and move use playlist-entry IDs, not collection-track IDs. `move_playlist_track(playlist_id, playlist_song_id, position, expected_revision)` wraps pyrekordbox's existing reorder method. Multi-entry moves preserve playlist order within the moved group.
 

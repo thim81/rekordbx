@@ -113,6 +113,10 @@ async def test_mcp_reads_entry_ids_and_moves_without_exposing_paths(library, tmp
         tracks = json.loads(tracks.content[0].text)
         assert [t['playlist_entry_id'] for t in tracks] == ['501','502','503']
         assert all('file_path' not in t for t in tracks)
+        detail = (await client.call_tool('get_playlist_detail', {'playlist_id': '100'})).structured_content
+        assert detail['revision'] == state['revision']
+        assert [t['playlist_entry_id'] for t in detail['tracks']] == ['501', '502', '503']
+        assert detail['tracks'][0]['file_path'] == '/private/original/music/track.mp3'
         moved = await client.call_tool('move_playlist_track', dict(playlist_id='100', playlist_song_id='503', position=1, expected_revision=state['revision']))
         assert not moved.is_error
         names = {t.name for t in await client.list_tools()}
@@ -141,9 +145,39 @@ async def test_orphaned_entries_remain_browsable_but_not_editable(library, tmp_p
     async with Client(build_server(library, tmp_path / 'backups')) as client:
         result = await client.call_tool('get_playlist_tracks', {'playlist_id':'100'})
         assert [t['playlist_entry_id'] for t in json.loads(result.content[0].text)] == ['501','503']
+        summaries = (await client.call_tool('get_playlists')).structured_content['result']
+        assert [(row['track_count'], row['duration']) for row in summaries] == [(3, 640)]
         state = service(library, tmp_path).read('100')
         assert state['editable'] is False
         assert [e['entry_id'] for e in state['entries']] == ['501','503']
+
+
+async def test_detail_reads_revision_and_metadata_from_the_same_transaction(library, tmp_path, monkeypatch):
+    from contextlib import closing
+    from fastmcp import Client
+    from pyrekordbox.masterdb.database import BLOB
+    from pyrekordbox.utils import deobfuscate
+    from sqlcipher3 import dbapi2 as sqlite
+    from rekordbx_mcp import server
+
+    with closing(sqlite.connect(library)) as writer:
+        writer.execute("PRAGMA key = '" + deobfuscate(BLOB) + "'")
+        assert writer.execute('PRAGMA journal_mode=WAL').fetchone()[0] == 'wal'
+        original_state = server.playlist_state
+
+        def change_after_state(db, playlist_id):
+            state = original_state(db, playlist_id)
+            with closing(sqlite.connect(library)) as other:
+                other.execute("PRAGMA key = '" + deobfuscate(BLOB) + "'")
+                other.execute("UPDATE djmdContent SET Title='New title' WHERE ID='1'")
+                other.commit()
+            return state
+
+        monkeypatch.setattr(server, 'playlist_state', change_after_state)
+        async with Client(server.build_server(library, tmp_path / 'backups')) as client:
+            detail = (await client.call_tool('get_playlist_detail', {'playlist_id': '100'})).structured_content
+            assert detail['tracks'][0]['title'] == 'One More Time'
+        assert writer.execute("SELECT Title FROM djmdContent WHERE ID='1'").fetchone()[0] == 'New title'
 
 
 @pytest.fixture

@@ -1,5 +1,6 @@
 """Direct Rekordbox playlist browsing/editing and local playlist operations."""
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -86,7 +87,7 @@ def raise_playlist_tool_error(name: str, message: str):
     logger.error("Rekordbox MCP tool returned an error (%s): %s", name, message)
     if name == "get_track_file_path" and "not found" in message.lower():
         raise HTTPException(404, "Rekordbox track not found.")
-    if name in {'edit_playlist', 'get_playlist_state', 'get_playlist_tracks', 'get_playlists', 'get_track_file_path'}:
+    if name in {'edit_playlist', 'get_playlist_state', 'get_playlist_detail', 'get_playlist_tracks', 'get_playlists', 'get_track_file_path'}:
         safe_errors = [
             ('sidecar', 409, 'Close Rekordbox cleanly; unresolved database transaction files prevent access.'),
             ('close rekordbox', 409, 'Close Rekordbox and its background agents to access the collection.'),
@@ -224,35 +225,24 @@ async def get_rekordbox_playlists():
     ]
 
 
-@router.get("/api/rekordbox/playlists/{playlist_id}/tracks")
-async def get_rekordbox_playlist_tracks(playlist_id: str):
-    records = await call_tool("get_playlist_tracks", {"playlist_id": playlist_id})
-    if not isinstance(records, list) or any(not isinstance(record, dict) for record in records):
-        raise HTTPException(502, "Unexpected Rekordbox playlist tracks.")
-    occurrences: dict[str, int] = {}
-    tracks = []
-    track_ids = [str(record["id"]) for record in records if record.get("id") is not None]
-    locations = await call_tool("get_collection_tracks", {"track_ids": track_ids}) if track_ids else []
-    if not isinstance(locations, list) or len(locations) != len(track_ids):
-        raise HTTPException(502, "Unexpected Rekordbox track locations.")
-    for track_id, location in zip(track_ids, locations, strict=True):
+def playlist_audio_paths(records: list[dict]) -> dict[str, Path]:
+    paths = {}
+    for record in records:
+        location = record.get("file_path")
         if (
-            not isinstance(location, dict)
-            or str(location.get("id")) != track_id
-            or not isinstance(location.get("file_path"), str)
-            or not Path(location["file_path"]).is_absolute()
-            or any(character in location["file_path"] for character in "\r\n\x00\x85\u2028\u2029")
+            not isinstance(location, str) or not Path(location).is_absolute()
+            or any(character in location for character in "\r\n\x00\x85\u2028\u2029")
         ):
             raise HTTPException(502, "Unexpected Rekordbox track locations.")
-        collection_mcp.track_paths[track_id] = Path(location["file_path"])
+        paths[str(record["id"])] = Path(location)
+    return paths
 
+
+def format_playlist_tracks(records: list[dict], paths: dict[str, Path]) -> list[dict]:
+    tracks = []
     for record in records:
-        if record.get("id") is None:
-            continue
         rekordbox_id = str(record["id"])
-        occurrence = occurrences.get(rekordbox_id, 0)
-        occurrences[rekordbox_id] = occurrence + 1
-        audio_path = collection_mcp.track_paths[rekordbox_id]
+        audio_path = paths[rekordbox_id]
         try:
             media = mutagen.File(audio_path, easy=True)
         except (OSError, ValueError, mutagen.MutagenError):
@@ -266,7 +256,7 @@ async def get_rekordbox_playlist_tracks(playlist_id: str):
             fallback=rekordbox_rating if 0 < rekordbox_rating <= 5 else None,
         )
         tracks.append({
-            "id": str(record.get("playlist_entry_id") or f"{rekordbox_id}-{occurrence + 1}"),
+            "id": str(record["playlist_entry_id"]),
             "rekordbox_id": rekordbox_id,
             "title": str(record.get("title") or ""),
             "artist": str(record.get("artist") or ""),
@@ -290,17 +280,25 @@ async def get_rekordbox_playlist_tracks(playlist_id: str):
     return tracks
 
 
+@router.get("/api/rekordbox/playlists/{playlist_id}/tracks")
+async def get_rekordbox_playlist_tracks(playlist_id: str):
+    return (await get_rekordbox_playlist_detail(playlist_id))["tracks"]
+
+
 @router.get('/api/rekordbox/playlists/{playlist_id}/detail')
 async def get_rekordbox_playlist_detail(playlist_id: str):
-    state = await call_tool('get_playlist_state', {'playlist_id': playlist_id})
-    tracks = await get_rekordbox_playlist_tracks(playlist_id)
-    after = await call_tool('get_playlist_state', {'playlist_id': playlist_id})
-    if state.get('revision') != after.get('revision') or [
-        (track['id'], track['rekordbox_id']) for track in tracks
-    ] != [(entry['entry_id'], entry['track_id']) for entry in state['entries']]:
-        raise HTTPException(409, 'Playlist changed; reload it before editing.')
-    return {'id': state['id'], 'name': state.get('name', ''),
-            'revision': state['revision'], 'editable': state.get('editable', False), 'tracks': tracks}
+    detail = await call_tool('get_playlist_detail', {'playlist_id': playlist_id})
+    records = detail.get("tracks") if isinstance(detail, dict) else None
+    if not isinstance(records, list) or any(
+        not isinstance(record, dict) or record.get("id") is None or record.get("playlist_entry_id") is None
+        for record in records
+    ):
+        raise HTTPException(502, "Unexpected Rekordbox playlist tracks.")
+    paths = playlist_audio_paths(records)
+    tracks = await asyncio.to_thread(format_playlist_tracks, records, paths)
+    collection_mcp.track_paths.update(paths)
+    return {'id': detail['id'], 'name': detail.get('name', ''),
+            'revision': detail['revision'], 'editable': detail.get('editable', False), 'tracks': tracks}
 
 
 def require_local_playlist_origin(http_request: Request):

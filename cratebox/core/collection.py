@@ -80,7 +80,7 @@ class CollectionClient:
         async with self.call_lock:
             attempts = 2 if name in {
                 "get_track_details", "get_collection_tracks", "get_playlists",
-                "get_playlist_tracks", "get_track_file_path",
+                "get_playlist_tracks", "get_playlist_detail", "get_track_file_path",
             } else 1
             for attempt in range(attempts):
                 client = await self.connect()
