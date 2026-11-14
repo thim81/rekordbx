@@ -144,8 +144,14 @@ function Index() {
       replace: true,
     });
   }, [navigate]);
-  const updateRekordboxUrl = useCallback((playlistId: string) => {
-    void navigate({ search: { rekordbox_playlist_id: playlistId }, replace: true });
+  const updateRekordboxUrl = useCallback((playlistId: string, trackId?: string) => {
+    void navigate({
+      search: {
+        rekordbox_playlist_id: playlistId,
+        ...(trackId ? { rekordbox_track_id: trackId } : {}),
+      },
+      replace: true,
+    });
   }, [navigate]);
   const clearPlaylistUrl = useCallback(() => {
     void navigate({ search: {}, replace: true });
@@ -991,8 +997,13 @@ function Index() {
         if (!preserveSelection) setSelectedTrackIds(new Set());
       }
       if (playlistSource === "crate" && activeId) updateCrateUrl(activeId, track?.id);
+      if (playlistSource === "rekordbox" && activeRekordboxId) {
+        const rekordboxTrackId = track?.rekordbox_id;
+        appliedRekordboxDeepLink.current = JSON.stringify([activeRekordboxId, rekordboxTrackId]);
+        updateRekordboxUrl(activeRekordboxId, rekordboxTrackId);
+      }
     },
-    [activeId, playlistSource, selectionKey, updateCrateUrl, view],
+    [activeId, activeRekordboxId, playlistSource, selectionKey, updateCrateUrl, updateRekordboxUrl, view],
   );
 
   useEffect(() => {

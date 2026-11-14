@@ -64,7 +64,10 @@ describe("Rekordbox playlist routing", () => {
     vi.stubGlobal("ResizeObserver", class {
       observe() {}
       unobserve() {}
+      disconnect() {}
     });
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
     Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { value: vi.fn(), configurable: true });
   });
 
@@ -72,6 +75,7 @@ describe("Rekordbox playlist routing", () => {
     act(() => root.unmount());
     container.remove();
     Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
@@ -110,10 +114,43 @@ describe("Rekordbox playlist routing", () => {
   });
 
   it("opens a nested playlist from a playlist-only URL", async () => {
-    await renderRoute("/?rekordbox_playlist_id=11");
+    const router = await renderRoute("/?rekordbox_playlist_id=11");
     expect(container.querySelector("h1")).toHaveTextContent("Test Playlist");
     expect(container.textContent).toContain("Second Track");
     expect(container.textContent).toContain("Rekordbox · Test Folder");
+
+    const secondTrackRow = Array.from(container.querySelectorAll("tr")).find((row) =>
+      row.textContent?.includes("Second Track"),
+    );
+    expect(secondTrackRow).toBeDefined();
+    await act(async () => secondTrackRow?.click());
+    expect(router.state.location.search).toEqual({
+      rekordbox_playlist_id: "11",
+      rekordbox_track_id: "102",
+    });
+  });
+
+  it("keeps the artwork filter on when double-clicking a Rekordbox track", async () => {
+    const router = await renderRoute("/?rekordbox_playlist_id=11");
+    await clickButton("Show tracks without artwork");
+    const secondTrackRow = Array.from(container.querySelectorAll("tr")).find((row) =>
+      row.textContent?.includes("Second Track"),
+    );
+    expect(secondTrackRow).toBeDefined();
+
+    await act(async () => {
+      secondTrackRow?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      secondTrackRow?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      secondTrackRow?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    });
+
+    expect(router.state.location.search).toEqual({
+      rekordbox_playlist_id: "11",
+      rekordbox_track_id: "102",
+    });
+    const artworkFilterButton = container.querySelector('button[aria-label="Show all tracks"]');
+    expect(artworkFilterButton).not.toBeNull();
+    expect(artworkFilterButton).toHaveAttribute("aria-pressed", "true");
   });
 
   it("opens a membership link at its track and returns to the crate with Back", async () => {
