@@ -8,6 +8,8 @@ args = [
   "--with", "mutagen",
   "--with", "ddgs",
   "--with", "playwright",
+  "--with", "onnxruntime",
+  "--with", "opencv-python-headless",
   "python", "/Users/thim/Sites/rekordbx/scripts/cratebox-mcp-launcher.py"
 ]
 startup_timeout_sec = 180

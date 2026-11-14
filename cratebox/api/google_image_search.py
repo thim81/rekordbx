@@ -4,11 +4,15 @@ import atexit
 import json
 import subprocess
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import urlopen
 from threading import Lock
+
+from .google_captcha import GoogleVerificationRequired, submit_challenge as _submit_captcha
+from .google_captcha import pause_before_interaction
 
 _SEARCH_LOCK = Lock()
 _MIN_SEARCH_INTERVAL_SECONDS = 2.0
@@ -22,9 +26,33 @@ _CHROME_PROFILE = Path("/tmp/cratebox-chrome")
 _DEVTOOLS_PORT_FILE = _CHROME_PROFILE / "DevToolsActivePort"
 _CHROME_PROCESS: subprocess.Popen | None = None
 
+_GOOGLE_INIT_SCRIPT = """
+(() => {
+    if (!["www.google.com", "consent.google.com", "www.recaptcha.net"].includes(location.hostname)) {
+        return;
+    }
 
-class GoogleVerificationRequired(RuntimeError):
-    """Google presented a human-verification challenge instead of search results."""
+    if (navigator.webdriver) {
+        Object.defineProperty(navigator, "webdriver", { configurable: true, get: () => false });
+    }
+    if (!navigator.plugins.length) {
+        const pdfViewer = { name: "PDF Viewer", filename: "internal-pdf-viewer",
+                            description: "Portable Document Format" };
+        const plugins = [pdfViewer];
+        plugins.item = index => plugins[index] ?? null;
+        plugins.namedItem = name => name === pdfViewer.name ? pdfViewer : null;
+        Object.defineProperty(navigator, "plugins", { configurable: true, get: () => plugins });
+    }
+    window.chrome ??= {};
+    window.chrome.runtime ??= {
+        connect() {},
+        sendMessage() {},
+        onMessage: { addListener() {} },
+    };
+    delete window.__playwright;
+    delete window.__pw_manual;
+})();
+"""
 
 
 def _stop_owned_chrome() -> None:
@@ -106,7 +134,7 @@ def search_google_images(query: str, *, limit: int = 24) -> list[dict[str, str]]
         if now < _GOOGLE_COOLDOWN_UNTIL:
             seconds = int(_GOOGLE_COOLDOWN_UNTIL - now + 0.999)
             raise GoogleVerificationRequired(
-                f"Google recently asked for human verification. Complete it in the minimized "
+                f"Google recently asked for human verification. Complete it in the "
                 f"CrateBox Chrome window, then retry in about {seconds} seconds."
             )
 
@@ -115,7 +143,7 @@ def search_google_images(query: str, *, limit: int = 24) -> list[dict[str, str]]
         except GoogleVerificationRequired as exc:
             _GOOGLE_COOLDOWN_UNTIL = time.monotonic() + _GOOGLE_COOLDOWN_SECONDS
             raise GoogleVerificationRequired(
-                "Google is asking for human verification. Complete it in the minimized "
+                f"{exc}. Complete the challenge in the "
                 "CrateBox Chrome window, then retry in about 60 seconds."
             ) from exc
 
@@ -126,9 +154,9 @@ def search_google_images(query: str, *, limit: int = 24) -> list[dict[str, str]]
 
 
 def _search_google_images(query: str, *, limit: int) -> list[dict[str, str]]:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout, sync_playwright
 
-    search_url = "https://www.google.com/search?" + urlencode({"udm": "2", "q": query})
+    search_url = "https://www.google.com/search?" + urlencode({"udm": "2", "hl": "en", "q": query})
     results = []
     seen = set()
     with sync_playwright() as playwright:
@@ -137,7 +165,8 @@ def _search_google_images(query: str, *, limit: int) -> list[dict[str, str]]:
         browser = playwright.chromium.connect_over_cdp(
             endpoint, no_defaults=True, timeout=10000
         )
-        try:
+        with ExitStack() as cleanup:
+            cleanup.callback(browser.close)
             context = browser.contexts[0]
             page = next(
                 (tab for tab in context.pages if urlsplit(tab.url).hostname == "www.google.com"),
@@ -146,39 +175,51 @@ def _search_google_images(query: str, *, limit: int) -> list[dict[str, str]]:
                 (tab for tab in context.pages if tab.url in {"about:blank", "chrome://newtab/"}),
                 None,
             ) or context.new_page()
-            _minimize_chrome_window(browser, page)
+            script = page.add_init_script(_GOOGLE_INIT_SCRIPT)
+            if script is not None:
+                cleanup.enter_context(script)
+            _set_chrome_window_state(page, "minimized")
+            pause_before_interaction(page)
             page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
             reject_cookies = page.get_by_role("button", name="Reject all", exact=True)
             if reject_cookies.count() and reject_cookies.is_visible():
+                pause_before_interaction(page)
                 reject_cookies.click(timeout=3000)
 
-            if _human_verification_required(page):
-                raise GoogleVerificationRequired(
-                    "Google is asking for human verification. Complete it in the minimized "
-                    "CrateBox Chrome window, then retry."
-                )
-
             cards = page.locator('[role="button"]:has(img[src*="encrypted-tbn"])')
-            try:
-                cards.first.wait_for(state="visible", timeout=12000)
-            except Exception as exc:
-                title = page.title()
-                page_text = " ".join(page.locator("body").inner_text(timeout=2000).split())[:240]
-                if _human_verification_required(page):
+            challenged = _human_verification_required(page)
+            if not challenged:
+                try:
+                    cards.first.wait_for(state="visible", timeout=12000)
+                except PlaywrightTimeout as exc:
+                    challenged = _human_verification_required(page)
+                    if not challenged:
+                        title = page.title()
+                        page_text = " ".join(page.locator("body").inner_text(timeout=2000).split())[:240]
+                        raise RuntimeError(
+                            f"Google Images cards unavailable (title={title!r}, cards={cards.count()}, "
+                            f"images={page.locator('img').count()}, page_text={page_text!r})"
+                        ) from exc
+
+            if challenged:
+                # Chrome pauses animation frames in hidden tabs, which blocks Playwright's stability checks.
+                _set_chrome_window_state(page, "normal")
+                page.bring_to_front()
+                if not _submit_captcha(page):
+                    raise GoogleVerificationRequired("Google still requires human verification")
+                try:
+                    cards.first.wait_for(state="visible", timeout=8000)
+                except PlaywrightTimeout as exc:
                     raise GoogleVerificationRequired(
-                        "Google is asking for human verification. Complete it in the minimized "
-                        "CrateBox Chrome window, then retry."
+                        "Google Images did not resume after automatic verification"
                     ) from exc
-                raise RuntimeError(
-                    f"Google Images cards unavailable (title={title!r}, cards={cards.count()}, "
-                    f"images={page.locator('img').count()}, page_text={page_text!r})"
-                ) from exc
+                _set_chrome_window_state(page, "minimized")
 
             for _ in range(3):
                 if cards.count() >= limit:
                     break
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(400)
+                pause_before_interaction(page, minimum_ms=400)
 
             for index in range(cards.count()):
                 card = cards.nth(index)
@@ -200,8 +241,6 @@ def _search_google_images(query: str, *, limit: int) -> list[dict[str, str]]:
                 seen.add(image_url)
                 if len(results) >= limit:
                     break
-        finally:
-            browser.close()
     return results
 
 
@@ -218,7 +257,6 @@ def _ensure_chrome() -> str:
         raise RuntimeError("Google Chrome is required for Google Images search")
 
     _CHROME_PROFILE.mkdir(parents=True, exist_ok=True)
-    _DEVTOOLS_PORT_FILE.unlink(missing_ok=True)
     _CHROME_PROCESS = subprocess.Popen(
         [
             str(chrome),
@@ -235,11 +273,13 @@ def _ensure_chrome() -> str:
         start_new_session=True,
     )
     for _ in range(60):
-        if _CHROME_PROCESS.poll() is not None:
-            raise RuntimeError("Could not start the dedicated Google Chrome browser")
+        # Chrome may forward the launch to an existing profile owner and exit.
+        exit_code = _CHROME_PROCESS.poll()
         endpoint = _existing_chrome_endpoint()
         if endpoint:
             return endpoint
+        if exit_code is not None:
+            raise RuntimeError(f"Could not start the dedicated Google Chrome browser (exit code {exit_code})")
         time.sleep(0.25)
     raise RuntimeError("Timed out starting the dedicated Google Chrome browser")
 
@@ -255,26 +295,13 @@ def _existing_chrome_endpoint() -> str | None:
         return None
 
 
-def _minimize_chrome_window(browser, page) -> None:
-    """Keep the dedicated search window out of the user's active workspace."""
-    session = browser.new_browser_cdp_session()
+def _set_chrome_window_state(page, state: str) -> None:
+    session = page.context.new_cdp_session(page)
     try:
-        targets = session.send("Target.getTargets").get("targetInfos", [])
-        target = next(
-            (
-                item
-                for item in targets
-                if item.get("type") == "page" and item.get("url") == page.url
-            ),
-            None,
+        window = session.send("Browser.getWindowForTarget")
+        session.send(
+            "Browser.setWindowBounds",
+            {"windowId": window["windowId"], "bounds": {"windowState": state}},
         )
-        if target:
-            window = session.send(
-                "Browser.getWindowForTarget", {"targetId": target["targetId"]}
-            )
-            session.send(
-                "Browser.setWindowBounds",
-                {"windowId": window["windowId"], "bounds": {"windowState": "minimized"}},
-            )
     finally:
         session.detach()

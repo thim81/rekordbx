@@ -10,6 +10,7 @@ if [ -x "$existing_mcp_env/bin/python" ] && [ ! -x "$mcp_dir/.venv/bin/python" ]
 fi
 
 uv --directory "$mcp_dir" run --locked --with fastapi --with uvicorn --with mutagen --with ddgs --with playwright \
+  --with onnxruntime --with opencv-python-headless \
   uvicorn --app-dir "$api_dir" server:app --host 127.0.0.1 --port 8000 &
 api_pid=$!
 
